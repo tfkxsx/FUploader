@@ -1,0 +1,102 @@
+# macOS / Windows
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100/
+.Trashes/
+Thumbs.db
+ehthumbs.db
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyre/
+.pytype/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+*.py,cover
+
+# Python packaging / build artifacts
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+wheels/
+share/python-wheels/
+MANIFEST
+*.manifest
+*.spec
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+__pypackages__/
+
+# Local environment and secrets
+.env
+.env.local
+.env.*.local
+.env.development
+.env.test
+.env.production
+!.env.example
+secrets.ini
+secrets.yaml
+secrets.yml
+secrets.json
+
+# Runtime outputs
+logs/
+*.log
+run/
+*.pid
+*.pid.lock
+
+# Temporary files
+.cache/
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Jupyter / notebooks
+.ipynb_checkpoints/
+
+# Node.js, if helper tooling is added later
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local agent/tooling notes
+.clinerules
+
+docs/
+metadatas/*

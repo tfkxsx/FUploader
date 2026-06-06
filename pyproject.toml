@@ -1,0 +1,39 @@
+[project]
+name = "FUploader"
+version = "1.0.1"
+description = "通用文件写入、打包、OSS 上传管线 SDK"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "data-team" },
+]
+dependencies = [
+    "aio-pika>=9.4.0",
+    "redis>=5.0.0",
+    "zstandard>=0.22.0",
+]
+
+[project.optional-dependencies]
+cos = ["cos-python-sdk-v5>=1.9.0"]
+oss = ["oss2>=2.18.0"]
+s3 = ["boto3>=1.34.0"]
+adapters = ["FUploader[cos,oss,s3]"]
+
+[build-system]
+requires = ["setuptools>=64.0", "setuptools-scm>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
