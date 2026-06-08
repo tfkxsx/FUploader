@@ -198,7 +198,7 @@ if __name__ == "__main__":
 | `storage_root` | `Path` | **必填** | 本地存储根目录 |
 | `slot_count` | `int` | `1` | 分片数（多进程写文件时避免文件锁竞争） |
 | `pack_threshold` | `int` | `1000` | 每个目录最多文件数，触发封口（seal） |
-| `write_concurrency` | `int` | `10` | 写文件 worker 协程数 |
+| `write_concurrency` | `int` | `50` | 写文件 worker 协程数 |
 | `packer_concurrency` | `int` | `2` | 打包上传 worker 协程数 |
 | `save_timeout` | `float` | `30.0` | 单文件写入超时（秒） |
 | `packer_interval` | `float` | `1.0` | 打包轮询间隔（秒） |

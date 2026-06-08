@@ -43,7 +43,7 @@ class FileWriterConfig:
     storage_root: Path
     slot_count: int = 1
     pack_threshold: int = 1000
-    write_concurrency: int = 10
+    write_concurrency: int = 50
     packer_concurrency: int = 2
     save_timeout: float = 30.0
     packer_interval: float = 1.0
