@@ -9,6 +9,7 @@ import asyncio
 import inspect
 import logging
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -72,6 +73,7 @@ class MetaWriter:
         self._slot_inflight: dict[int, int] = {}
         self._sealing_slots: dict[int, str] = {}
         self._slot_states: dict[int, SlotRuntimeState] = {}
+        self._effective_prefetch_count = max(config.prefetch_count, config.write_concurrency)
         self._write_queue_maxsize = max(
             1,
             max(1, config.prefetch_count) * max(1, config.meta_writer_process_count),
@@ -80,6 +82,7 @@ class MetaWriter:
             maxsize=self._write_queue_maxsize,
         )
         self._write_workers: list[asyncio.Task[None]] = []
+        self._write_executor: ThreadPoolExecutor | None = None
 
     # ------------------------------------------------------------------
     # 启动 & 停止
@@ -90,21 +93,25 @@ class MetaWriter:
         if self._running:
             return
         self._running = True
+        if self._write_executor is None:
+            self._write_executor = self._new_write_executor()
         await self._seal_over_threshold_slots_on_start()
         await self._load_owned_slot_states()
-        await self._source.set_prefetch_count(self._cfg.prefetch_count)
+        await self._source.set_prefetch_count(self._effective_prefetch_count)
         self._write_workers = [
             asyncio.create_task(self._write_worker(worker_id))
             for worker_id in range(self._cfg.write_concurrency)
         ]
         await self._source.start_consume(self._handle_message)
         logger.info(
-            "MetaWriter started (slots=%s, threshold=%s, write_concurrency=%s, prefetch=%s, "
+            "MetaWriter started (slots=%s, threshold=%s, write_concurrency=%s, configured_prefetch=%s, "
+            "effective_prefetch=%s, "
             "process_count=%s, queue_maxsize=%s, slot_strategy=%s, worker_index=%s, max_tasks_per_child=%s)",
             self._cfg.slot_count,
             self._cfg.pack_threshold,
             self._cfg.write_concurrency,
             self._cfg.prefetch_count,
+            self._effective_prefetch_count,
             self._cfg.meta_writer_process_count,
             self._write_queue_maxsize,
             self._cfg.slot_strategy,
@@ -115,6 +122,7 @@ class MetaWriter:
     async def stop(self) -> None:
         """停止写入服务。"""
         if not self._running:
+            self._shutdown_write_executor()
             return
         self._running = False
         await self._source.stop_consume()
@@ -122,6 +130,7 @@ class MetaWriter:
             await self._write_queue.put(None)
         await asyncio.gather(*self._write_workers, return_exceptions=True)
         self._write_workers.clear()
+        self._shutdown_write_executor()
         logger.info("MetaWriter stopped")
 
     # ------------------------------------------------------------------
@@ -343,14 +352,27 @@ class MetaWriter:
     async def _write_file(self, path: Path, content: bytes) -> None:
         """异步写入文件（带超时）。"""
         loop = asyncio.get_running_loop()
+        if self._write_executor is None:
+            self._write_executor = self._new_write_executor()
 
         def _sync_write() -> None:
             path.write_bytes(content)
 
         await asyncio.wait_for(
-            loop.run_in_executor(None, _sync_write),
+            loop.run_in_executor(self._write_executor, _sync_write),
             timeout=self._cfg.save_timeout,
         )
+
+    def _new_write_executor(self) -> ThreadPoolExecutor:
+        return ThreadPoolExecutor(
+            max_workers=self._cfg.write_concurrency,
+            thread_name_prefix="file-uploader-writer",
+        )
+
+    def _shutdown_write_executor(self) -> None:
+        if self._write_executor is not None:
+            self._write_executor.shutdown(wait=True)
+            self._write_executor = None
 
     def _select_slot(self, file_name: str) -> int:
         if self._cfg.slot_strategy == "worker_index":

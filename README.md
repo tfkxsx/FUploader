@@ -198,14 +198,14 @@ if __name__ == "__main__":
 | `storage_root` | `Path` | **必填** | 本地存储根目录 |
 | `slot_count` | `int` | `1` | 分片数（多进程写文件时避免文件锁竞争） |
 | `pack_threshold` | `int` | `1000` | 每个目录最多文件数，触发封口（seal） |
-| `write_concurrency` | `int` | `10` | 写文件 worker 协程数 |
+| `write_concurrency` | `int` | `20` | 单进程真实写盘并发数；同时决定 writer worker 数和专用写盘线程池大小 |
 | `packer_concurrency` | `int` | `2` | 打包上传 worker 协程数 |
 | `save_timeout` | `float` | `30.0` | 单文件写入超时（秒） |
 | `packer_interval` | `float` | `1.0` | 打包轮询间隔（秒） |
 | `packer_max_retries` | `int` | `3` | 打包失败最大重试次数（0=不重试，直接丢弃） |
 | `batch_size` | `int` | `100` | 批量 ACK 阈值 |
 | `flush_interval` | `float` | `5.0` | 时间窗口 flush（秒） |
-| `prefetch_count` | `int` | `META_WRITER_RABBITMQ_PREFETCH_COUNT` 或 `50` | 单个 writer 进程的消息预取数 |
+| `prefetch_count` | `int` | `META_WRITER_RABBITMQ_PREFETCH_COUNT` 或 `50` | 单个 writer 进程的消息预取数；运行时不会低于 `write_concurrency` |
 | `meta_writer_process_count` | `int` | `META_WRITER_PROCESS_COUNT` 或 `1` | writer 进程数；与 `prefetch_count` 的乘积作为本地写队列容量 |
 | `meta_writer_max_tasks_per_child` | `int` | `1000` | 单个 worker 成功处理多少条后优雅轮转（0=禁用） |
 | `node_id` | `str` | `NODE_ID` 或 `node_id-{本机IP}` | 当前节点 ID |

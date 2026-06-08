@@ -759,7 +759,7 @@ class TestMetaWriter:
             slot_count=1,
             pack_threshold=2,
             write_concurrency=2,
-            prefetch_count=7,
+            prefetch_count=1,
             meta_writer_process_count=3,
             meta_writer_max_tasks_per_child=0,
         )
@@ -800,8 +800,9 @@ class TestMetaWriter:
                 break
             await asyncio.sleep(0.05)
 
-        assert msg_src.prefetch_count == 7
-        assert writer._write_queue.maxsize == 21
+        assert msg_src.prefetch_count == 2
+        assert writer._effective_prefetch_count == config.write_concurrency
+        assert writer._write_queue.maxsize == 3
         assert max_active_writes == 2
         assert writer._save_ok == 2
         assert await state_store.pop_ready_dir() == "0:slot_0_0"
@@ -841,6 +842,7 @@ class TestMetaWriter:
         )
 
         assert len(thread_ids) == 2
+        await writer.stop()
 
     async def test_processing_failure_propagates_for_message_source_nack(self, config, state_store, tmp_path):
         from file_uploader.services.meta_writer import MetaWriter
