@@ -53,6 +53,7 @@ class RabbitMQSource(MessageSource):
         self._queue: Optional[aio_pika.RobustQueue] = None
         self._consumer_tag: Optional[str] = None
         self._consume_task: Optional[asyncio.Task] = None
+        self._callback_tasks: set[asyncio.Task[None]] = set()
         self._inflight_messages = 0
         self._idle_event = asyncio.Event()
         self._idle_event.set()
@@ -101,10 +102,9 @@ class RabbitMQSource(MessageSource):
         """内部消费循环。"""
         try:
             async for message in listener:
-                try:
-                    await callback(message)
-                except Exception:
-                    logger.exception("Unhandled error in consumer callback, continuing")
+                task = asyncio.create_task(callback(message))
+                self._callback_tasks.add(task)
+                task.add_done_callback(self._callback_tasks.discard)
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -121,7 +121,6 @@ class RabbitMQSource(MessageSource):
 
     async def stop_consume(self) -> None:
         logger.info("Stopping RabbitMQ consumer...")
-        await self._idle_event.wait()
         if self._consume_task:
             self._consume_task.cancel()
             try:
@@ -129,6 +128,9 @@ class RabbitMQSource(MessageSource):
             except asyncio.CancelledError:
                 pass
             self._consume_task = None
+        if self._callback_tasks:
+            await asyncio.gather(*tuple(self._callback_tasks), return_exceptions=True)
+        await self._idle_event.wait()
         if self._channel and not self._channel.is_closed:
             await self._channel.close()
         if self._connection and not self._connection.is_closed:
@@ -136,6 +138,6 @@ class RabbitMQSource(MessageSource):
         logger.info("RabbitMQ consumer stopped")
 
     async def set_prefetch_count(self, count: int) -> None:
+        self._prefetch_count = count
         if self._channel and not self._channel.is_closed:
             await self._channel.set_qos(prefetch_count=count)
-            self._prefetch_count = count

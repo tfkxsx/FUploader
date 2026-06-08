@@ -44,6 +44,17 @@ def get_meta_writer_process_count(default: int = 1) -> int:
         raise ValueError("META_WRITER_PROCESS_COUNT must be an integer >= 1") from exc
 
 
+def get_meta_writer_rabbitmq_prefetch_count(default: int = 50) -> int:
+    """Return META_WRITER_RABBITMQ_PREFETCH_COUNT, falling back to default."""
+    raw_value = os.environ.get("META_WRITER_RABBITMQ_PREFETCH_COUNT", "").strip()
+    if not raw_value:
+        return max(1, default)
+    try:
+        return max(1, int(raw_value))
+    except ValueError as exc:
+        raise ValueError("META_WRITER_RABBITMQ_PREFETCH_COUNT must be an integer >= 1") from exc
+
+
 def get_meta_writer_max_tasks_per_child(default: int = 1000) -> int:
     """Return META_WRITER_MAX_TASKS_PER_CHILD, falling back to default."""
     raw_value = os.environ.get("META_WRITER_MAX_TASKS_PER_CHILD", "").strip()

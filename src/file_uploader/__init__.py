@@ -37,7 +37,12 @@ from .messages import (
 from .packers import tar_zstd_packer
 from .pipeline import FileWriterPipeline, run_pipeline_once, run_pipeline_supervised
 from .recovery import ResidualRecovery
-from .runtime import get_meta_writer_max_tasks_per_child, get_meta_writer_process_count, get_node_id
+from .runtime import (
+    get_meta_writer_max_tasks_per_child,
+    get_meta_writer_process_count,
+    get_meta_writer_rabbitmq_prefetch_count,
+    get_node_id,
+)
 from .services import MetaPacker, MetaWriter
 
 __all__ = [
@@ -80,5 +85,6 @@ __all__ = [
     "run_pipeline_supervised",
     "get_meta_writer_max_tasks_per_child",
     "get_meta_writer_process_count",
+    "get_meta_writer_rabbitmq_prefetch_count",
     "get_node_id",
 ]

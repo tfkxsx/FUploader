@@ -198,14 +198,15 @@ if __name__ == "__main__":
 | `storage_root` | `Path` | **必填** | 本地存储根目录 |
 | `slot_count` | `int` | `1` | 分片数（多进程写文件时避免文件锁竞争） |
 | `pack_threshold` | `int` | `1000` | 每个目录最多文件数，触发封口（seal） |
-| `write_concurrency` | `int` | `50` | 写文件 worker 协程数 |
+| `write_concurrency` | `int` | `10` | 写文件 worker 协程数 |
 | `packer_concurrency` | `int` | `2` | 打包上传 worker 协程数 |
 | `save_timeout` | `float` | `30.0` | 单文件写入超时（秒） |
 | `packer_interval` | `float` | `1.0` | 打包轮询间隔（秒） |
 | `packer_max_retries` | `int` | `3` | 打包失败最大重试次数（0=不重试，直接丢弃） |
 | `batch_size` | `int` | `100` | 批量 ACK 阈值 |
 | `flush_interval` | `float` | `5.0` | 时间窗口 flush（秒） |
-| `prefetch_count` | `int` | `50` | 消息预取数 |
+| `prefetch_count` | `int` | `META_WRITER_RABBITMQ_PREFETCH_COUNT` 或 `50` | 单个 writer 进程的消息预取数 |
+| `meta_writer_process_count` | `int` | `META_WRITER_PROCESS_COUNT` 或 `1` | writer 进程数；与 `prefetch_count` 的乘积作为本地写队列容量 |
 | `meta_writer_max_tasks_per_child` | `int` | `1000` | 单个 worker 成功处理多少条后优雅轮转（0=禁用） |
 | `node_id` | `str` | `NODE_ID` 或 `node_id-{本机IP}` | 当前节点 ID |
 | `task_name` | `str` | `""` | legacy Redis key 使用的任务名 |
@@ -221,6 +222,7 @@ if __name__ == "__main__":
 |------|--------|------|
 | `META_WRITER_PROCESS_COUNT` | `1` | supervisor 启动的 worker 进程数，同时也是 legacy 模式 slot 数 |
 | `META_WRITER_MAX_TASKS_PER_CHILD` | `1000` | 可映射到 `meta_writer_max_tasks_per_child`，达到后 worker 优雅退出并由 supervisor 拉起 |
+| `META_WRITER_RABBITMQ_PREFETCH_COUNT` | `50` | 映射到 `prefetch_count`；与 `META_WRITER_PROCESS_COUNT` 的乘积决定 writer 本地队列容量 |
 
 ## 核心组件
 
@@ -495,6 +497,7 @@ src/file_uploader/
 | Pipeline | `run_pipeline_supervised` | Supervisor 模式守护 Pipeline 子进程 |
 | 工具 | `get_node_id` | 获取当前节点 ID |
 | 工具 | `get_meta_writer_process_count` | 读取 META_WRITER_PROCESS_COUNT 环境变量 |
+| 工具 | `get_meta_writer_rabbitmq_prefetch_count` | 读取 META_WRITER_RABBITMQ_PREFETCH_COUNT 环境变量 |
 | 工具 | `get_meta_writer_max_tasks_per_child` | 读取 META_WRITER_MAX_TASKS_PER_CHILD 环境变量 |
 
 ## License

@@ -1,6 +1,6 @@
 [project]
 name = "FUploader"
-version = "1.0.2"
+version = "1.0.3"
 description = "通用文件写入、打包、OSS 上传管线 SDK"
 readme = "README.md"
 requires-python = ">=3.10"

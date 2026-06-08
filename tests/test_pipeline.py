@@ -7,6 +7,7 @@ import base64
 import gzip
 import json
 import re
+import threading
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Optional
@@ -294,6 +295,30 @@ class InMemoryMessageSource(MessageSource):
         msg = _FakeMessage(body=body)
         await self._queue.put(msg)
         return msg
+
+
+class ConcurrentMessageSource(InMemoryMessageSource):
+    """并发调用 callback，模拟 RabbitMQ basic.consume 的在途消息。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.prefetch_count: int | None = None
+        self._tasks: set[asyncio.Task[None]] = set()
+
+    async def _feed(self) -> None:
+        while True:
+            msg = await self._queue.get()
+            if msg is None:
+                break
+            if self._callback:
+                task = asyncio.create_task(self._callback(msg.body))
+                self._tasks.add(task)
+                task.add_done_callback(self._tasks.discard)
+        if self._tasks:
+            await asyncio.gather(*tuple(self._tasks))
+
+    async def set_prefetch_count(self, count: int) -> None:
+        self.prefetch_count = count
 
 
 # ---------------------------------------------------------------------------
@@ -651,6 +676,7 @@ class TestMetaWriter:
     def test_legacy_meta_config_uses_worker_slot(self, temp_storage, monkeypatch):
         monkeypatch.setenv("NODE_ID", "node_id-10.0.0.8-meta-p1")
         monkeypatch.setenv("META_WRITER_PROCESS_COUNT", "4")
+        monkeypatch.setenv("META_WRITER_RABBITMQ_PREFETCH_COUNT", "20")
         monkeypatch.setenv("META_WRITER_MAX_TASKS_PER_CHILD", "77")
 
         cfg = FileWriterConfig.legacy_meta(
@@ -661,18 +687,26 @@ class TestMetaWriter:
         assert cfg.node_id == "node_id-10.0.0.8-meta-p1"
         assert cfg.worker_index == 1
         assert cfg.slot_count == 4
+        assert cfg.meta_writer_process_count == 4
+        assert cfg.prefetch_count == 20
         assert cfg.meta_writer_max_tasks_per_child == 77
         assert cfg.slot_strategy == "worker_index"
         assert cfg.storage_layout == "legacy_meta"
         assert cfg.ready_dir_format == "legacy_slot"
 
     def test_meta_writer_process_count_reads_env(self, monkeypatch):
-        from file_uploader import get_meta_writer_max_tasks_per_child, get_meta_writer_process_count
+        from file_uploader import (
+            get_meta_writer_max_tasks_per_child,
+            get_meta_writer_process_count,
+            get_meta_writer_rabbitmq_prefetch_count,
+        )
 
         monkeypatch.setenv("META_WRITER_PROCESS_COUNT", "6")
+        monkeypatch.setenv("META_WRITER_RABBITMQ_PREFETCH_COUNT", "24")
         monkeypatch.setenv("META_WRITER_MAX_TASKS_PER_CHILD", "88")
 
         assert get_meta_writer_process_count() == 6
+        assert get_meta_writer_rabbitmq_prefetch_count() == 24
         assert get_meta_writer_max_tasks_per_child() == 88
 
     async def test_write_one_message(self, config, state_store, tmp_path):
@@ -714,6 +748,123 @@ class TestMetaWriter:
 
         files = list(config.storage_root.rglob("*.json"))
         assert len(files) >= 1, f"Expected at least 1 file, got {files}"
+
+        await writer.stop()
+
+    async def test_write_concurrency_runs_multiple_writes_in_parallel(self, state_store, tmp_path):
+        from file_uploader.services.meta_writer import MetaWriter
+
+        config = FileWriterConfig(
+            storage_root=tmp_path / "concurrent_writer",
+            slot_count=1,
+            pack_threshold=2,
+            write_concurrency=2,
+            prefetch_count=7,
+            meta_writer_process_count=3,
+            meta_writer_max_tasks_per_child=0,
+        )
+        msg_src = ConcurrentMessageSource()
+        writer = MetaWriter(
+            config=config,
+            state_store=state_store,
+            message_source=msg_src,
+            message_parser=_demo_parser,
+            file_name_generator=_demo_name_gen,
+        )
+        await state_store.initialize_runtime_state(
+            slots=[
+                SlotRuntimeState(slot=i, active_dir_id=f"slot_{i}_0", active_count=0, dir_seq=0)
+                for i in range(config.slot_count)
+            ],
+            ready_dirs=[],
+        )
+
+        active_writes = 0
+        max_active_writes = 0
+
+        async def slow_write(path: Path, content: bytes) -> None:
+            nonlocal active_writes, max_active_writes
+            active_writes += 1
+            max_active_writes = max(max_active_writes, active_writes)
+            await asyncio.sleep(0.1)
+            path.write_bytes(content)
+            active_writes -= 1
+
+        writer._write_file = slow_write  # type: ignore[method-assign]
+        await writer.start()
+        await msg_src.send(json.dumps({"id": "a"}).encode())
+        await msg_src.send(json.dumps({"id": "b"}).encode())
+
+        for _ in range(30):
+            if writer._save_ok == 2:
+                break
+            await asyncio.sleep(0.05)
+
+        assert msg_src.prefetch_count == 7
+        assert writer._write_queue.maxsize == 21
+        assert max_active_writes == 2
+        assert writer._save_ok == 2
+        assert await state_store.pop_ready_dir() == "0:slot_0_0"
+        slot_state = await state_store.get_slot_state(0)
+        assert slot_state is not None
+        assert slot_state.active_count == 0
+        await writer.stop()
+
+    async def test_write_file_runs_on_multiple_executor_threads(self, config, state_store, tmp_path, monkeypatch):
+        from file_uploader.services.meta_writer import MetaWriter
+
+        writer = MetaWriter(
+            config=replace(config, storage_root=tmp_path / "threaded_writer"),
+            state_store=state_store,
+            message_source=InMemoryMessageSource(),
+            message_parser=_demo_parser,
+            file_name_generator=_demo_name_gen,
+        )
+        original_write_bytes = Path.write_bytes
+        barrier = threading.Barrier(2)
+        thread_ids: set[int] = set()
+        thread_ids_lock = threading.Lock()
+
+        def blocking_write_bytes(path: Path, content: bytes) -> int:
+            with thread_ids_lock:
+                thread_ids.add(threading.get_ident())
+            barrier.wait(timeout=2)
+            return original_write_bytes(path, content)
+
+        monkeypatch.setattr(Path, "write_bytes", blocking_write_bytes)
+        target_dir = tmp_path / "threaded_writer"
+        target_dir.mkdir(parents=True)
+
+        await asyncio.gather(
+            writer._write_file(target_dir / "a.json", b"{}"),
+            writer._write_file(target_dir / "b.json", b"{}"),
+        )
+
+        assert len(thread_ids) == 2
+
+    async def test_processing_failure_propagates_for_message_source_nack(self, config, state_store, tmp_path):
+        from file_uploader.services.meta_writer import MetaWriter
+
+        config = replace(config, storage_root=tmp_path / "failed_writer")
+        msg_src = InMemoryMessageSource()
+        writer = MetaWriter(
+            config=config,
+            state_store=state_store,
+            message_source=msg_src,
+            message_parser=_demo_parser,
+            file_name_generator=_demo_name_gen,
+        )
+        await state_store.initialize_runtime_state(
+            slots=[
+                SlotRuntimeState(slot=i, active_dir_id=f"slot_{i}_0", active_count=0, dir_seq=0)
+                for i in range(config.slot_count)
+            ],
+            ready_dirs=[],
+        )
+        await writer.start()
+
+        with pytest.raises(json.JSONDecodeError):
+            await writer._handle_message(b"not-json")
 
         await writer.stop()
 

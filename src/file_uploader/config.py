@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
 from .runtime import (
     get_meta_writer_max_tasks_per_child,
     get_meta_writer_process_count,
+    get_meta_writer_rabbitmq_prefetch_count,
     get_node_id,
     worker_index_from_node_id,
 )
@@ -29,7 +30,8 @@ class FileWriterConfig:
         packer_max_retries: 打包失败最大重试次数（0=不重试，直接丢弃）。
         batch_size: 批量 ack 阈值。
         flush_interval: 时间窗口 flush（秒）。
-        prefetch_count: 消息预取数。
+        prefetch_count: 单个 writer 进程的消息预取数。
+        meta_writer_process_count: writer 进程数；与 prefetch_count 的乘积作为本地写队列容量。
         meta_writer_max_tasks_per_child: 单个 writer 子进程成功处理多少条消息后优雅轮转（0=禁用）。
         node_id: 当前节点 ID，默认 node_id-{本机IP}，子进程中由 supervisor 注入 -meta-pN。
         task_name: legacy Redis key 命名使用的任务名。
@@ -43,14 +45,15 @@ class FileWriterConfig:
     storage_root: Path
     slot_count: int = 1
     pack_threshold: int = 1000
-    write_concurrency: int = 50
+    write_concurrency: int = 10
     packer_concurrency: int = 2
     save_timeout: float = 30.0
     packer_interval: float = 1.0
     packer_max_retries: int = 3
     batch_size: int = 100
     flush_interval: float = 5.0
-    prefetch_count: int = 50
+    prefetch_count: int = field(default_factory=get_meta_writer_rabbitmq_prefetch_count)
+    meta_writer_process_count: int = field(default_factory=get_meta_writer_process_count)
     meta_writer_max_tasks_per_child: int = 1000
     node_id: str = ""
     task_name: str = ""
@@ -85,6 +88,8 @@ class FileWriterConfig:
             raise ValueError("flush_interval must be > 0")
         if self.prefetch_count < 1:
             raise ValueError("prefetch_count must be >= 1")
+        if self.meta_writer_process_count < 1:
+            raise ValueError("meta_writer_process_count must be >= 1")
         if self.meta_writer_max_tasks_per_child < 0:
             raise ValueError("meta_writer_max_tasks_per_child must be >= 0")
         if self.worker_index is not None and self.worker_index < 0:
@@ -111,6 +116,8 @@ class FileWriterConfig:
     ) -> "FileWriterConfig":
         """Create config aligned with the verified main_meta_writer.py layout."""
         resolved_process_count = get_meta_writer_process_count() if process_count is None else max(1, process_count)
+        kwargs.setdefault("prefetch_count", get_meta_writer_rabbitmq_prefetch_count())
+        kwargs.setdefault("meta_writer_process_count", resolved_process_count)
         kwargs.setdefault("meta_writer_max_tasks_per_child", get_meta_writer_max_tasks_per_child())
         return cls(
             storage_root=storage_root,

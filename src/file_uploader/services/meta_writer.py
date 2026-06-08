@@ -9,6 +9,7 @@ import asyncio
 import inspect
 import logging
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -20,6 +21,12 @@ from ..layout import active_dir_path, encode_ready_dir, format_dir_id, sealed_di
 from ..messages import DecodedFilePayload, serialize_file_payload
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _PendingWrite:
+    raw_body: bytes
+    completed: asyncio.Future[None]
 
 
 class MetaWriter:
@@ -61,6 +68,18 @@ class MetaWriter:
         self._rotation_requested = False
         self._rotation_stop_task: asyncio.Task[None] | None = None
         self._slot_lock = asyncio.Lock()
+        self._slot_condition = asyncio.Condition(self._slot_lock)
+        self._slot_inflight: dict[int, int] = {}
+        self._sealing_slots: dict[int, str] = {}
+        self._slot_states: dict[int, SlotRuntimeState] = {}
+        self._write_queue_maxsize = max(
+            1,
+            max(1, config.prefetch_count) * max(1, config.meta_writer_process_count),
+        )
+        self._write_queue: asyncio.Queue[_PendingWrite | None] = asyncio.Queue(
+            maxsize=self._write_queue_maxsize,
+        )
+        self._write_workers: list[asyncio.Task[None]] = []
 
     # ------------------------------------------------------------------
     # 启动 & 停止
@@ -72,11 +91,22 @@ class MetaWriter:
             return
         self._running = True
         await self._seal_over_threshold_slots_on_start()
+        await self._load_owned_slot_states()
+        await self._source.set_prefetch_count(self._cfg.prefetch_count)
+        self._write_workers = [
+            asyncio.create_task(self._write_worker(worker_id))
+            for worker_id in range(self._cfg.write_concurrency)
+        ]
         await self._source.start_consume(self._handle_message)
         logger.info(
-            "MetaWriter started (slots=%s, threshold=%s, slot_strategy=%s, worker_index=%s, max_tasks_per_child=%s)",
+            "MetaWriter started (slots=%s, threshold=%s, write_concurrency=%s, prefetch=%s, "
+            "process_count=%s, queue_maxsize=%s, slot_strategy=%s, worker_index=%s, max_tasks_per_child=%s)",
             self._cfg.slot_count,
             self._cfg.pack_threshold,
+            self._cfg.write_concurrency,
+            self._cfg.prefetch_count,
+            self._cfg.meta_writer_process_count,
+            self._write_queue_maxsize,
             self._cfg.slot_strategy,
             self._cfg.worker_index,
             self._cfg.meta_writer_max_tasks_per_child,
@@ -88,6 +118,10 @@ class MetaWriter:
             return
         self._running = False
         await self._source.stop_consume()
+        for _ in self._write_workers:
+            await self._write_queue.put(None)
+        await asyncio.gather(*self._write_workers, return_exceptions=True)
+        self._write_workers.clear()
         logger.info("MetaWriter stopped")
 
     # ------------------------------------------------------------------
@@ -95,49 +129,102 @@ class MetaWriter:
     # ------------------------------------------------------------------
 
     async def _handle_message(self, raw_body: bytes) -> None:
-        """单条消息处理入口。"""
+        """将消息交给写 worker，并在完成后返回给消息源执行 ack。"""
+        if not self._running:
+            raise RuntimeError("MetaWriter is not running")
+        completed = asyncio.get_running_loop().create_future()
+        await self._write_queue.put(_PendingWrite(raw_body=raw_body, completed=completed))
+        await completed
+
+    async def _write_worker(self, worker_id: int) -> None:
+        logger.debug("MetaWriter worker %s started", worker_id)
+        while True:
+            pending = await self._write_queue.get()
+            if pending is None:
+                self._write_queue.task_done()
+                break
+            try:
+                await self._process_message(pending.raw_body)
+            except Exception as exc:
+                if not pending.completed.done():
+                    pending.completed.set_exception(exc)
+            else:
+                if not pending.completed.done():
+                    pending.completed.set_result(None)
+            finally:
+                self._write_queue.task_done()
+        logger.debug("MetaWriter worker %s stopped", worker_id)
+
+    async def _process_message(self, raw_body: bytes) -> None:
+        """解析并写入单条消息。"""
         try:
             data = self._parser(raw_body)
             if inspect.isawaitable(data):
                 data = await data
         except Exception:
-            logger.exception("Failed to parse message, discarding")
-            return
+            logger.exception("Failed to parse message")
+            raise
 
         try:
             file_name = self._name_gen(data)
         except Exception:
-            logger.exception("Failed to generate file name, discarding")
-            return
+            logger.exception("Failed to generate file name")
+            raise
 
         slot = self._select_slot(file_name)
 
-        async with self._slot_lock:
-            state = await self._store.get_slot_state(slot)
+        async with self._slot_condition:
+            await self._slot_condition.wait_for(lambda: slot not in self._sealing_slots)
+            state = self._slot_states.get(slot)
             if state is None:
-                logger.error("Slot %s state not found in store, discarding", slot)
-                return
+                state = await self._store.get_slot_state(slot)
+                if state is None:
+                    raise RuntimeError(f"Slot {slot} state not found in store")
+                self._slot_states[slot] = state
 
-            # 写入文件
             dir_path = active_dir_path(self._cfg, slot, state.active_dir_id)
-            file_path = dir_path / file_name
+            observed_dir_id = state.active_dir_id
+            self._slot_inflight[slot] = self._slot_inflight.get(slot, 0) + 1
 
-            try:
-                content = self._serialize(data)
-                await self._write_file(file_path, content)
-            except Exception:
-                logger.exception("Failed to write file %s", file_path)
-                return
-
-            # 更新计数 & 检查封口
+        file_path = dir_path / file_name
+        should_seal = False
+        is_sealer = False
+        try:
+            content = self._serialize(data)
+            await self._write_file(file_path, content)
             should_seal, new_count = await self._store.increment_and_check_threshold(
                 slot, delta=1, threshold=self._cfg.pack_threshold,
             )
-
             logger.debug("Slot=%s file=%s count=%s seal=%s", slot, file_name, new_count, should_seal)
 
             if should_seal:
-                await self._seal_slot(state)
+                async with self._slot_condition:
+                    current_state = self._slot_states.get(slot)
+                    if (
+                        current_state is not None
+                        and current_state.active_dir_id == observed_dir_id
+                        and slot not in self._sealing_slots
+                    ):
+                        self._sealing_slots[slot] = observed_dir_id
+                        is_sealer = True
+        except Exception:
+            logger.exception("Failed to process file %s", file_path)
+            raise
+        finally:
+            async with self._slot_condition:
+                self._slot_inflight[slot] -= 1
+                self._slot_condition.notify_all()
+
+        if is_sealer:
+            async with self._slot_condition:
+                await self._slot_condition.wait_for(lambda: self._slot_inflight.get(slot, 0) == 0)
+                current_state = self._slot_states.get(slot)
+                try:
+                    if current_state is not None and current_state.active_dir_id == observed_dir_id:
+                        await self._seal_slot(current_state)
+                finally:
+                    self._sealing_slots.pop(slot, None)
+                    self._slot_condition.notify_all()
 
         self._save_ok += 1
         await self._request_rotation_if_needed()
@@ -145,6 +232,13 @@ class MetaWriter:
     # ------------------------------------------------------------------
     # 封口逻辑
     # ------------------------------------------------------------------
+
+    async def _load_owned_slot_states(self) -> None:
+        """Cache active directory metadata so the hot path does not serialize on Redis."""
+        for slot in self._owned_slots():
+            state = await self._store.get_slot_state(slot)
+            if state is not None:
+                self._slot_states[slot] = state
 
     async def _seal_over_threshold_slots_on_start(self) -> None:
         """Seal active dirs that already reached the threshold before this process started."""
@@ -201,14 +295,24 @@ class MetaWriter:
         source_dir = active_dir_path(self._cfg, state.slot, state.active_dir_id)
         if self._cfg.storage_layout == "legacy_meta":
             target_dir = sealed_dir_path(self._cfg, state.slot, state.active_dir_id)
-            target_dir.parent.mkdir(parents=True, exist_ok=True)
-            if target_dir.exists():
-                shutil.rmtree(target_dir, ignore_errors=True)
-            if source_dir.exists():
-                source_dir.rename(target_dir)
+
+            def _move_to_sealed() -> None:
+                target_dir.parent.mkdir(parents=True, exist_ok=True)
+                if target_dir.exists():
+                    shutil.rmtree(target_dir, ignore_errors=True)
+                if source_dir.exists():
+                    source_dir.rename(target_dir)
+
+            await asyncio.to_thread(_move_to_sealed)
 
         # 原子切换目录 + 归零计数 + 递增 seq
         await self._store.switch_slot_dir(state.slot, next_dir_id)
+        self._slot_states[state.slot] = SlotRuntimeState(
+            slot=state.slot,
+            active_dir_id=next_dir_id,
+            active_count=0,
+            dir_seq=next_seq,
+        )
 
         # 将封口目录加入待打包队列
         await self._store.enqueue_ready_dir(ready_dir)
