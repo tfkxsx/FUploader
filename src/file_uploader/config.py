@@ -10,6 +10,7 @@ from .runtime import (
     get_meta_writer_max_tasks_per_child,
     get_meta_writer_process_count,
     get_meta_writer_rabbitmq_prefetch_count,
+    get_residue_file_upload,
     get_node_id,
     worker_index_from_node_id,
 )
@@ -40,6 +41,7 @@ class FileWriterConfig:
         storage_layout: "flat_slot" 使用 slot_0_0；"legacy_meta" 使用 active/slot-0/dir-000001。
         ready_dir_format: "colon" 使用 0:dir；"legacy_slot" 使用 slot-0:dir。
         resume_orphan_archives: 启动时是否恢复孤儿归档文件。
+        residue_file_upload: 停机后是否执行单进程全局残留归并/打包/上传。
     """
 
     storage_root: Path
@@ -62,6 +64,7 @@ class FileWriterConfig:
     storage_layout: Literal["flat_slot", "legacy_meta"] = "flat_slot"
     ready_dir_format: Literal["colon", "legacy_slot"] = "colon"
     resume_orphan_archives: bool = True
+    residue_file_upload: bool = field(default_factory=get_residue_file_upload)
 
     def __post_init__(self) -> None:
         if not self.node_id:

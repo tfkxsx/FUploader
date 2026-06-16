@@ -66,6 +66,12 @@ SDK 通过抽象接口解耦外部依赖，方便替换不同中间件：
 
 启动时自动扫描 `storage_root`，找出非当前活跃的 `slot_*` 目录，重新加入待打包队列，防止进程崩溃后数据丢失。
 
+可选地，也可以在正常停机时开启残留收尾上传：
+
+- 设置 `RESIDUE_FILE_UPLOADE=true` 后，`pipeline.stop()` 会在 writer / packer 停止后触发一次单进程 global finalize
+- finalize 会归并残留文件、按 `pack_threshold` 切分，并将不足阈值的尾包整体打包上传
+- 只有一个进程会执行该流程；如果上传失败，`stop()` 会抛出异常且保留 runtime state，便于后续恢复
+
 ## 安装
 
 ```bash
@@ -215,6 +221,7 @@ if __name__ == "__main__":
 | `storage_layout` | `str` | `"flat_slot"` | `flat_slot` 或 `legacy_meta` |
 | `ready_dir_format` | `str` | `"colon"` | `colon` 或 `legacy_slot` |
 | `resume_orphan_archives` | `bool` | `True` | 启动时是否恢复孤儿目录 |
+| `residue_file_upload` | `bool` | `RESIDUE_FILE_UPLOADE` / `RESIDUE_FILE_UPLOAD` 或 `False` | 正常停机时是否执行单进程残留归并、尾包打包与上传 |
 
 环境变量：
 
@@ -223,6 +230,7 @@ if __name__ == "__main__":
 | `META_WRITER_PROCESS_COUNT` | `1` | supervisor 启动的 worker 进程数，同时也是 legacy 模式 slot 数 |
 | `META_WRITER_MAX_TASKS_PER_CHILD` | `1000` | 可映射到 `meta_writer_max_tasks_per_child`，达到后 worker 优雅退出并由 supervisor 拉起 |
 | `META_WRITER_RABBITMQ_PREFETCH_COUNT` | `50` | 映射到 `prefetch_count`；与 `META_WRITER_PROCESS_COUNT` 的乘积决定 writer 本地队列容量 |
+| `RESIDUE_FILE_UPLOADE` | `False` | 开启后在 `pipeline.stop()` 阶段执行 residual finalize；兼容读取 `RESIDUE_FILE_UPLOAD` |
 
 ## 核心组件
 

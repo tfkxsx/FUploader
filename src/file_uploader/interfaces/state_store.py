@@ -55,6 +55,16 @@ class StateStore(ABC):
         """检查初始化锁是否存在。"""
         ...
 
+    @abstractmethod
+    async def try_acquire_finalize_lock(self, token: str) -> bool:
+        """尝试获取停机 finalize 锁。"""
+        ...
+
+    @abstractmethod
+    async def release_finalize_lock(self) -> None:
+        """释放停机 finalize 锁。"""
+        ...
+
     # -- 运行时状态标记 --
 
     @abstractmethod

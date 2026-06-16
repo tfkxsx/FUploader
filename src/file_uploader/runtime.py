@@ -66,6 +66,20 @@ def get_meta_writer_max_tasks_per_child(default: int = 1000) -> int:
         raise ValueError("META_WRITER_MAX_TASKS_PER_CHILD must be an integer >= 0") from exc
 
 
+def get_residue_file_upload(default: bool = False) -> bool:
+    """Return RESIDUE_FILE_UPLOADE/RESIDUE_FILE_UPLOAD as a boolean flag."""
+    for env_name in ("RESIDUE_FILE_UPLOADE", "RESIDUE_FILE_UPLOAD"):
+        raw_value = os.environ.get(env_name, "").strip().lower()
+        if not raw_value:
+            continue
+        if raw_value in {"1", "true", "yes", "on"}:
+            return True
+        if raw_value in {"0", "false", "no", "off"}:
+            return False
+        raise ValueError(f"{env_name} must be a boolean value")
+    return default
+
+
 def node_scope(node_id: str) -> str:
     """Strip worker suffixes so node-local workers share one Redis scope."""
     normalized = node_id.strip()

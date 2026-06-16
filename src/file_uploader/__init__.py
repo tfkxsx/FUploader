@@ -41,6 +41,7 @@ from .runtime import (
     get_meta_writer_max_tasks_per_child,
     get_meta_writer_process_count,
     get_meta_writer_rabbitmq_prefetch_count,
+    get_residue_file_upload,
     get_node_id,
 )
 from .services import MetaPacker, MetaWriter
@@ -86,5 +87,6 @@ __all__ = [
     "get_meta_writer_max_tasks_per_child",
     "get_meta_writer_process_count",
     "get_meta_writer_rabbitmq_prefetch_count",
+    "get_residue_file_upload",
     "get_node_id",
 ]

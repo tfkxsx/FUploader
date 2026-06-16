@@ -6,18 +6,23 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import shutil
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..config import FileWriterConfig
+    from ..interfaces.object_store import ObjectStore
     from ..interfaces.state_store import StateStore
+    from ..interfaces.strategies import Packer, RemoteKeyGenerator
 from ..layout import (
     active_dir_path,
     active_root,
+    decode_ready_dir,
     encode_ready_dir,
     ensure_layout_roots,
     format_dir_id,
@@ -152,6 +157,44 @@ class ResidualRecovery:
                     logger.info("Orphan archive %s enqueued as ready key %s", arc_path.name, ready_key)
 
         return total
+
+    async def finalize_and_upload(
+        self,
+        *,
+        object_store: "ObjectStore",
+        packer: "Packer",
+        remote_key_generator: "RemoteKeyGenerator",
+        packer_max_retries: int = 0,
+        resume_orphan_archives: bool = True,
+    ) -> int:
+        """Finalize residual files into archives and upload them during shutdown."""
+        recovered = await self.scan_and_recover()
+        await self._enqueue_remainder_for_finalize()
+        ready_dirs = await self._drain_ready_dirs()
+        if not ready_dirs:
+            logger.info("No residual ready dirs to finalize during shutdown")
+            return recovered
+
+        uploaded = 0
+        for ready_dir in ready_dirs:
+            try:
+                uploaded += await self._process_ready_dir_with_retry(
+                    ready_dir,
+                    object_store=object_store,
+                    packer=packer,
+                    remote_key_generator=remote_key_generator,
+                    packer_max_retries=packer_max_retries,
+                    resume_orphan_archives=resume_orphan_archives,
+                )
+            except Exception:
+                await self._store.enqueue_ready_dir(ready_dir)
+                raise
+        logger.info(
+            "Residual finalize complete: recovered_json=%s uploaded_archives=%s",
+            recovered,
+            uploaded,
+        )
+        return recovered
 
     async def _scan_and_recover_legacy_meta(self) -> int:
         """Recover active/sealed/slot-N/dir-000001 layout used by main_meta_writer.py."""
@@ -358,3 +401,165 @@ class ResidualRecovery:
             if not dir_path.exists():
                 orphans.append(arc)
         return orphans
+
+    async def _drain_ready_dirs(self) -> list[str]:
+        ready_dirs: list[str] = []
+        while True:
+            ready_dir = await self._store.dequeue_ready_dir()
+            if ready_dir is None:
+                return ready_dirs
+            ready_dirs.append(ready_dir)
+
+    async def _enqueue_remainder_for_finalize(self) -> None:
+        if self._config is None:
+            return
+        slot_count = max(1, self._config.slot_count)
+        for slot in range(slot_count):
+            state = await self._store.get_slot_state(slot)
+            if state is None or state.active_count <= 0:
+                continue
+            ready_dir = encode_ready_dir(self._config, slot, state.active_dir_id)
+            if self._config.storage_layout == "legacy_meta":
+                source_dir = active_dir_path(self._config, slot, state.active_dir_id)
+                target_dir = sealed_dir_path(self._config, slot, state.active_dir_id)
+                target_dir.parent.mkdir(parents=True, exist_ok=True)
+                if target_dir.exists():
+                    shutil.rmtree(target_dir, ignore_errors=True)
+                if source_dir.exists():
+                    source_dir.rename(target_dir)
+            await self._store.enqueue_ready_dir(ready_dir)
+
+    async def _process_ready_dir_immediately(
+        self,
+        ready_dir: str,
+        *,
+        object_store: "ObjectStore",
+        packer: "Packer",
+        remote_key_generator: "RemoteKeyGenerator",
+        packer_max_retries: int,
+        resume_orphan_archives: bool,
+    ) -> int:
+        slot, dir_id = decode_ready_dir(ready_dir)
+        dir_path = sealed_dir_path(self._config, slot, dir_id) if self._config else self._root / dir_id
+        if self._config is not None and self._config.storage_layout != "legacy_meta":
+            dir_path = self._config.storage_root / dir_id
+
+        if not dir_path.exists():
+            if not resume_orphan_archives:
+                logger.warning("Ready dir not found on disk during finalize: %s", dir_path)
+                return 0
+            archive_path = self._find_orphan_archive(dir_path.parent)
+            if not archive_path.exists():
+                logger.warning("Ready dir and orphan archive both missing during finalize: %s", dir_path)
+                return 0
+            return await self._upload_archive(archive_path, object_store, remote_key_generator, dir_path)
+
+        if not any(dir_path.iterdir()):
+            shutil.rmtree(dir_path, ignore_errors=True)
+            return 0
+
+        archive_path = await self._pack_with_retry(packer, dir_path, packer_max_retries)
+        if archive_path is None:
+            logger.error("Packing failed for residual dir %s, keeping local files", dir_path)
+            return 0
+
+        return await self._upload_archive(archive_path, object_store, remote_key_generator, dir_path)
+
+    async def _process_ready_dir_with_retry(
+        self,
+        ready_dir: str,
+        *,
+        object_store: "ObjectStore",
+        packer: "Packer",
+        remote_key_generator: "RemoteKeyGenerator",
+        packer_max_retries: int,
+        resume_orphan_archives: bool,
+    ) -> int:
+        max_attempts = max(1, packer_max_retries + 1)
+        last_exc: Exception | None = None
+        for attempt in range(max_attempts):
+            try:
+                return await self._process_ready_dir_immediately(
+                    ready_dir,
+                    object_store=object_store,
+                    packer=packer,
+                    remote_key_generator=remote_key_generator,
+                    packer_max_retries=packer_max_retries,
+                    resume_orphan_archives=resume_orphan_archives,
+                )
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= max_attempts - 1:
+                    break
+                wait_seconds = 2 ** attempt
+                logger.warning(
+                    "Retrying residual finalize for %s in %ss (attempt %s/%s)",
+                    ready_dir,
+                    wait_seconds,
+                    attempt + 2,
+                    max_attempts,
+                )
+                await asyncio.sleep(wait_seconds)
+        assert last_exc is not None
+        raise RuntimeError(f"Residual finalize failed for {ready_dir}") from last_exc
+
+    async def _pack_with_retry(self, packer: "Packer", dir_path: Path, max_retries: int) -> Path | None:
+        import inspect
+
+        for attempt in range(max_retries + 1):
+            try:
+                result = packer(dir_path)
+                if inspect.isawaitable(result):
+                    result = await result
+                if result is not None:
+                    return result
+            except Exception:
+                logger.exception(
+                    "Residual finalize pack attempt %s/%s failed for %s",
+                    attempt + 1,
+                    max_retries + 1,
+                    dir_path,
+                )
+            if attempt < max_retries:
+                await asyncio.sleep(2 ** attempt)
+        return None
+
+    async def _upload_archive(
+        self,
+        archive_path: Path,
+        object_store: "ObjectStore",
+        remote_key_generator: "RemoteKeyGenerator",
+        dir_path: Path,
+    ) -> int:
+        archive_path = self._ensure_unique_archive_name(archive_path)
+        remote_key = remote_key_generator(archive_path.name)
+        upload_ok = await object_store.upload(archive_path, remote_key)
+        if not upload_ok:
+            raise RuntimeError(f"Residual finalize upload failed for {archive_path}")
+        archive_path.unlink(missing_ok=True)
+        shutil.rmtree(dir_path, ignore_errors=True)
+        logger.info("Finalized residual archive %s -> %s", archive_path, remote_key)
+        return 1
+
+    @staticmethod
+    def _ensure_unique_archive_name(archive_path: Path) -> Path:
+        from datetime import datetime
+
+        expected = archive_path.with_name(
+            f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{uuid.uuid4().hex[:8]}.tar.zst"
+        )
+        if archive_path == expected:
+            return archive_path
+        while expected.exists():
+            expected = archive_path.with_name(
+                f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{uuid.uuid4().hex[:8]}.tar.zst"
+            )
+        archive_path.rename(expected)
+        return expected
+
+    @staticmethod
+    def _find_orphan_archive(directory: Path) -> Path:
+        archives = sorted(directory.glob("*.tar.zst")) if directory.exists() else []
+        if archives:
+            return archives[0]
+        return directory / "__missing__.tar.zst"

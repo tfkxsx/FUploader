@@ -12,6 +12,7 @@ import multiprocessing
 import os
 import signal
 import time
+import uuid
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -192,12 +193,20 @@ class FileWriterPipeline:
     async def stop(self) -> None:
         """优雅关闭 Pipeline。"""
         logger.info("Stopping FileWriterPipeline...")
-        tasks = []
         if self._writer:
-            tasks.append(self._writer.stop())
+            await self._writer.stop()
         if self._packer_svc:
-            tasks.append(self._packer_svc.stop())
-        await asyncio.gather(*tasks, return_exceptions=True)
+            await self._packer_svc.stop()
+
+        finalize_completed = False
+        if self._should_finalize_residual_files():
+            finalize_completed = await self._finalize_residual_files()
+
+        if finalize_completed and self._state_store:
+            try:
+                await self._state_store.clear_state()
+            except Exception:
+                logger.exception("Error clearing state after residual finalize")
 
         if self._state_store:
             if isinstance(self._state_store, object) and hasattr(self._state_store, "disconnect"):
@@ -231,6 +240,42 @@ class FileWriterPipeline:
         self._rotation_requested = True
         if self._shutdown_event is not None:
             self._shutdown_event.set()
+
+    def _should_finalize_residual_files(self) -> bool:
+        if self._rotation_requested:
+            return False
+        return bool(self._config and self._config.residue_file_upload)
+
+    async def _finalize_residual_files(self) -> bool:
+        assert self._config is not None
+        assert self._state_store is not None
+        assert self._object_store is not None
+        assert self._packer is not None
+        assert self._remote_key_generator is not None
+
+        token = str(uuid.uuid4())
+        acquired = await self._state_store.try_acquire_finalize_lock(token)
+        if not acquired:
+            logger.info("Another instance is finalizing residual files, skipping")
+            return False
+
+        try:
+            recovery = ResidualRecovery(
+                storage_root=self._config.storage_root,
+                state_store=self._state_store,
+                pack_threshold=self._config.pack_threshold,
+                config=self._config,
+            )
+            await recovery.finalize_and_upload(
+                object_store=self._object_store,
+                packer=self._packer,
+                remote_key_generator=self._remote_key_generator,
+                packer_max_retries=self._config.packer_max_retries,
+                resume_orphan_archives=self._config.resume_orphan_archives,
+            )
+            return True
+        finally:
+            await self._state_store.release_finalize_lock()
 
     # ------------------------------------------------------------------
     # 运行时状态初始化

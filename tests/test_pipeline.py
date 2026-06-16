@@ -43,6 +43,7 @@ class InMemoryStateStore(StateStore):
         self._lock = asyncio.Lock()
         self._has_runtime = False
         self._init_lock_held: Optional[str] = None
+        self._finalize_lock_held: Optional[str] = None
         self._slots: dict[int, _MemSlotState] = {}
         self._ready_dirs: list[str] = []
         self._pack_locks: dict[str, str] = {}
@@ -95,6 +96,17 @@ class InMemoryStateStore(StateStore):
     async def is_init_locked(self) -> bool:
         async with self._lock:
             return self._init_lock_held is not None
+
+    async def try_acquire_finalize_lock(self, token: str) -> bool:
+        async with self._lock:
+            if self._finalize_lock_held is not None:
+                return False
+            self._finalize_lock_held = token
+            return True
+
+    async def release_finalize_lock(self) -> None:
+        async with self._lock:
+            self._finalize_lock_held = None
 
     # ---- slot ----
 
@@ -339,6 +351,18 @@ class InMemoryObjectStore(ObjectStore):
         return remote_key in self._store
 
 
+class FlakyObjectStore(InMemoryObjectStore):
+    def __init__(self, failures_before_success: int) -> None:
+        super().__init__()
+        self._remaining_failures = failures_before_success
+
+    async def upload(self, local_path: Path, remote_key: str) -> bool:
+        if self._remaining_failures > 0:
+            self._remaining_failures -= 1
+            return False
+        return await super().upload(local_path, remote_key)
+
+
 class SlowInitStateStore(InMemoryStateStore):
     """StateStore that makes init visible as a blocking operation."""
 
@@ -491,6 +515,165 @@ class TestPipelineStartStop:
         )
         await p.start()
         assert await state_store.has_runtime_state() is True
+
+    async def test_stop_finalizes_residual_files_when_enabled(
+        self, config, state_store, object_store, tmp_path
+    ):
+        config = replace(
+            config,
+            storage_root=tmp_path / "shutdown_finalize",
+            slot_count=1,
+            pack_threshold=3,
+            residue_file_upload=True,
+            packer_interval=60.0,
+        )
+        msg_src = InMemoryMessageSource()
+        pipeline = (
+            FileWriterPipeline.with_config(config)
+            .with_state_store(state_store)
+            .with_message_source(msg_src)
+            .with_object_store(object_store)
+            .with_message_parser(_demo_parser)
+            .with_file_name_generator(_demo_name_gen)
+            .with_packer(_noop_packer)
+            .with_remote_key_generator(_demo_key_gen)
+            .no_recovery()
+        )
+
+        await pipeline.start()
+        await msg_src.send(json.dumps({"id": "a"}).encode())
+        await msg_src.send(json.dumps({"id": "b"}).encode())
+
+        for _ in range(20):
+            if len(list(config.storage_root.rglob("*.json"))) == 2:
+                break
+            await asyncio.sleep(0.1)
+
+        await pipeline.stop()
+
+        assert len(object_store._store) == 1
+        assert not list(config.storage_root.rglob("*.json"))
+        assert await state_store.has_runtime_state() is False
+
+    async def test_stop_skips_finalize_during_rotation(
+        self, state_store, object_store, tmp_path
+    ):
+        config = FileWriterConfig(
+            storage_root=tmp_path / "rotation_finalize_skip",
+            slot_count=1,
+            pack_threshold=10,
+            residue_file_upload=True,
+            meta_writer_max_tasks_per_child=1,
+            packer_interval=60.0,
+        )
+        msg_src = InMemoryMessageSource()
+        pipeline = (
+            FileWriterPipeline.with_config(config)
+            .with_state_store(state_store)
+            .with_message_source(msg_src)
+            .with_object_store(object_store)
+            .with_message_parser(_demo_parser)
+            .with_file_name_generator(_demo_name_gen)
+            .with_packer(_noop_packer)
+            .with_remote_key_generator(_demo_key_gen)
+            .no_recovery()
+        )
+
+        await pipeline.start()
+        await msg_src.send(json.dumps({"id": "rotate"}).encode())
+
+        for _ in range(30):
+            if pipeline.rotation_requested:
+                break
+            await asyncio.sleep(0.1)
+
+        await pipeline.stop()
+
+        assert pipeline.rotation_requested is True
+        assert len(object_store._store) == 0
+        assert list(config.storage_root.rglob("*.json"))
+
+    async def test_stop_finalize_failure_raises_and_keeps_runtime_state(
+        self, config, state_store, tmp_path
+    ):
+        config = replace(
+            config,
+            storage_root=tmp_path / "shutdown_finalize_failure",
+            slot_count=1,
+            pack_threshold=3,
+            residue_file_upload=True,
+            packer_interval=60.0,
+            packer_max_retries=0,
+        )
+        object_store = FlakyObjectStore(failures_before_success=10)
+        msg_src = InMemoryMessageSource()
+        pipeline = (
+            FileWriterPipeline.with_config(config)
+            .with_state_store(state_store)
+            .with_message_source(msg_src)
+            .with_object_store(object_store)
+            .with_message_parser(_demo_parser)
+            .with_file_name_generator(_demo_name_gen)
+            .with_packer(_noop_packer)
+            .with_remote_key_generator(_demo_key_gen)
+            .no_recovery()
+        )
+
+        await pipeline.start()
+        await msg_src.send(json.dumps({"id": "a"}).encode())
+        await msg_src.send(json.dumps({"id": "b"}).encode())
+
+        for _ in range(20):
+            if len(list(config.storage_root.rglob("*.json"))) == 2:
+                break
+            await asyncio.sleep(0.1)
+
+        with pytest.raises(RuntimeError, match="Residual finalize failed"):
+            await pipeline.stop()
+
+        assert await state_store.has_runtime_state() is True
+        assert await state_store.dequeue_ready_dir() == "0:slot_0_0"
+        assert list(config.storage_root.rglob("*.json"))
+
+    async def test_stop_finalize_retries_failed_upload(
+        self, config, state_store, tmp_path
+    ):
+        config = replace(
+            config,
+            storage_root=tmp_path / "shutdown_finalize_retry",
+            slot_count=1,
+            pack_threshold=3,
+            residue_file_upload=True,
+            packer_interval=60.0,
+            packer_max_retries=2,
+        )
+        object_store = FlakyObjectStore(failures_before_success=1)
+        msg_src = InMemoryMessageSource()
+        pipeline = (
+            FileWriterPipeline.with_config(config)
+            .with_state_store(state_store)
+            .with_message_source(msg_src)
+            .with_object_store(object_store)
+            .with_message_parser(_demo_parser)
+            .with_file_name_generator(_demo_name_gen)
+            .with_packer(_noop_packer)
+            .with_remote_key_generator(_demo_key_gen)
+            .no_recovery()
+        )
+
+        await pipeline.start()
+        await msg_src.send(json.dumps({"id": "a"}).encode())
+        await msg_src.send(json.dumps({"id": "b"}).encode())
+
+        for _ in range(20):
+            if len(list(config.storage_root.rglob("*.json"))) == 2:
+                break
+            await asyncio.sleep(0.1)
+
+        await pipeline.stop()
+
+        assert len(object_store._store) == 1
+        assert await state_store.has_runtime_state() is False
 
     async def test_concurrent_start_bootstraps_runtime_state_once(self, config, object_store):
         started = asyncio.Event()
@@ -699,15 +882,18 @@ class TestMetaWriter:
             get_meta_writer_max_tasks_per_child,
             get_meta_writer_process_count,
             get_meta_writer_rabbitmq_prefetch_count,
+            get_residue_file_upload,
         )
 
         monkeypatch.setenv("META_WRITER_PROCESS_COUNT", "6")
         monkeypatch.setenv("META_WRITER_RABBITMQ_PREFETCH_COUNT", "24")
         monkeypatch.setenv("META_WRITER_MAX_TASKS_PER_CHILD", "88")
+        monkeypatch.setenv("RESIDUE_FILE_UPLOADE", "true")
 
         assert get_meta_writer_process_count() == 6
         assert get_meta_writer_rabbitmq_prefetch_count() == 24
         assert get_meta_writer_max_tasks_per_child() == 88
+        assert get_residue_file_upload() is True
 
     async def test_write_one_message(self, config, state_store, tmp_path):
         from file_uploader.services.meta_writer import MetaWriter

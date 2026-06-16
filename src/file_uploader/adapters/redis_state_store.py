@@ -139,6 +139,10 @@ class RedisStateStore(StateStore):
     def _legacy_init_lock_key(self) -> str:
         return self._legacy_k("init_lock")
 
+    @property
+    def _legacy_finalize_lock_key(self) -> str:
+        return self._legacy_k("finalize_lock")
+
     # -- 初始化锁（SET NX 实现） --
 
     async def try_acquire_init_lock(self, token: str) -> bool:
@@ -158,6 +162,17 @@ class RedisStateStore(StateStore):
         if self._key_style == "legacy_meta":
             return bool(await self.client.exists(self._legacy_init_lock_key))
         return bool(await self.client.exists(self._k("lock:init")))
+
+    async def try_acquire_finalize_lock(self, token: str) -> bool:
+        if self._key_style == "legacy_meta":
+            return bool(await self.client.set(self._legacy_finalize_lock_key, token, nx=True, ex=self._lock_ttl))
+        return bool(await self.client.set(self._k("lock:finalize"), token, nx=True, ex=self._lock_ttl))
+
+    async def release_finalize_lock(self) -> None:
+        if self._key_style == "legacy_meta":
+            await self.client.delete(self._legacy_finalize_lock_key)
+            return
+        await self.client.delete(self._k("lock:finalize"))
 
     # -- 运行时状态 --
 
@@ -357,7 +372,10 @@ class RedisStateStore(StateStore):
             cursor = 0
             while True:
                 cursor, keys = await self.client.scan(cursor, match=pattern, count=100)
-                keys = [key for key in keys if key != self._legacy_init_lock_key]
+                keys = [
+                    key for key in keys
+                    if key not in {self._legacy_init_lock_key, self._legacy_finalize_lock_key}
+                ]
                 if keys:
                     await self.client.delete(*keys)
                 if cursor == 0:
@@ -366,10 +384,11 @@ class RedisStateStore(StateStore):
             return
         pattern = self._k("*")
         init_lock_key = self._k("lock:init")
+        finalize_lock_key = self._k("lock:finalize")
         cursor = 0
         while True:
             cursor, keys = await self.client.scan(cursor, match=pattern, count=100)
-            keys = [key for key in keys if key != init_lock_key]
+            keys = [key for key in keys if key not in {init_lock_key, finalize_lock_key}]
             if keys:
                 await self.client.delete(*keys)
             if cursor == 0:
